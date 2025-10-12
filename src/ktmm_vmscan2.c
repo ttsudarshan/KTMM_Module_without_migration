@@ -218,6 +218,9 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
 /**
  * print_system_allocation_stats - print current system-wide allocation statistics
  */
+/**
+ * print_system_allocation_stats - print current system-wide allocation statistics
+ */
 static void print_system_allocation_stats(void)
 {
 	struct zone *zone;
@@ -232,7 +235,7 @@ static void print_system_allocation_stats(void)
 		for_each_zone(zone) {
 			// Calculate allocated pages: managed_pages - free_pages
 			unsigned long free_pages = zone_page_state(zone, NR_FREE_PAGES);
-			unsigned long managed_pages = zone->managed_pages;
+			unsigned long managed_pages = zone->managed_pages.counter; // Use .counter for atomic_long_t
 			node_allocated += (managed_pages - free_pages);
 		}
 		
