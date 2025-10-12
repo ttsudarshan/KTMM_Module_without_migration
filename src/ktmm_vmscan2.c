@@ -415,14 +415,14 @@ static inline bool ktmm_folio_needs_release(struct folio *folio)
 /**
  * print_allocation_stats - print current allocation statistics
  */
-static void print_allocation_stats(struct pglist_data *pgdat)
-{
-	printk(KERN_INFO "ALLOCATION STATS - Node %d (%s): DRAM pages: %d, PMEM pages: %d\n",
-	       pgdat->node_id, 
-	       pgdat->pm_node ? "PMEM" : "DRAM",
-	       atomic_read(&dram_allocations), 
-	       atomic_read(&pmem_allocations));
-}
+// static void print_allocation_stats(struct pglist_data *pgdat)
+// {
+// 	printk(KERN_INFO "ALLOCATION STATS - Node %d (%s): DRAM pages: %d, PMEM pages: %d\n",
+// 	       pgdat->node_id, 
+// 	       pgdat->pm_node ? "PMEM" : "DRAM",
+// 	       atomic_read(&dram_allocations), 
+// 	       atomic_read(&pmem_allocations));
+// }
 
 
 /**
@@ -604,7 +604,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 		}
 
 		folio_clear_active(folio);	// we are de-activating
-		folio_set_workingsset(folio);
+		folio_set_workingset(folio);
 		list_add(&folio->lru, &l_inactive);
 	}
 
@@ -659,7 +659,7 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_scanned;
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
-	unsigned long nr_reclaimed = 0;
+	//unsigned long nr_reclaimed = 0;
 	bool file = is_file_lru(lru);
 	int nid = pgdat->node_id;
 	//pr_info("scanning inactive list");
