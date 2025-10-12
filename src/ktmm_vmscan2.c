@@ -53,10 +53,13 @@ int pmem_node = -1;
 /* holds pointers to the tmemd daemons running per node */
 static struct task_struct *tmemd_list[MAX_NUMNODES];
 
-
 /* per node tmemd wait queues */
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
+/************** PAGE ALLOCATION TRACKING VARIABLES *************************/
+static atomic_t dram_allocations = ATOMIC_INIT(0);
+static atomic_t pmem_allocations = ATOMIC_INIT(0);
+static atomic_t total_scans = ATOMIC_INIT(0);
 
 /************** MISC HOOKED FUNCTION PROTOTYPES *****************************/
 static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
@@ -124,7 +127,7 @@ static bool ktmm_zone_watermark_ok_safe(struct zone *z,
 					unsigned long mark,
 					int highest_zoneidx)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_zone_watermark_ok_safe(z, order, mark, highest_zoneidx);
 }
@@ -132,7 +135,7 @@ static bool ktmm_zone_watermark_ok_safe(struct zone *z,
 
 static struct pglist_data *ktmm_first_online_pgdat(void)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_first_online_pgdat();
 }
@@ -140,7 +143,7 @@ static struct pglist_data *ktmm_first_online_pgdat(void)
 
 static struct zone *ktmm_next_zone(struct zone *zone)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_next_zone(zone);
 }
@@ -148,7 +151,7 @@ static struct zone *ktmm_next_zone(struct zone *zone)
 
 static void ktmm_free_unref_page_list(struct list_head *list)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_free_unref_page_list(list);
 }
@@ -156,7 +159,7 @@ static void ktmm_free_unref_page_list(struct list_head *list)
 
 static void ktmm_lru_add_drain(void)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	pt_lru_add_drain();
 }
@@ -165,7 +168,7 @@ static void ktmm_lru_add_drain(void)
 static void ktmm_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
 					int zid, int nr_pages)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	pt_cgroup_update_lru_size(lruvec, lru, zid, nr_pages);
 }
@@ -173,7 +176,7 @@ static void ktmm_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru
 
 static void ktmm_cgroup_uncharge_list(struct list_head *page_list)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	pt_cgroup_uncharge_list(page_list);
 }
@@ -183,7 +186,7 @@ static unsigned long ktmm_isolate_lru_folios(unsigned long nr_to_scan, struct lr
 					struct list_head *dst, unsigned long *nr_scanned,
 					struct scan_control *sc, enum lru_list lru)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_isolate_lru_folios(nr_to_scan, lruvec, dst, nr_scanned, sc, lru);
 }
@@ -191,7 +194,7 @@ static unsigned long ktmm_isolate_lru_folios(unsigned long nr_to_scan, struct lr
 
 static unsigned int ktmm_move_folios_to_lru(struct lruvec *lruvec, struct list_head *list)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_move_folios_to_lru(lruvec, list);
 }
@@ -199,7 +202,7 @@ static unsigned int ktmm_move_folios_to_lru(struct lruvec *lruvec, struct list_h
 
 static void ktmm_folio_putback_lru(struct folio *folio)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	pt_folio_putback_lru(folio);
 }
@@ -208,7 +211,7 @@ static void ktmm_folio_putback_lru(struct folio *folio)
 static int ktmm_folio_referenced(struct folio *folio, int is_locked,
 				struct mem_cgroup *memcg, unsigned long *vm_flags)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return pt_folio_referenced(folio, is_locked, memcg, vm_flags);
 }
@@ -227,9 +230,17 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
  */
 struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 	gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
-	return alloc_page(gfp_mask);
+	struct page *new_page = alloc_page(gfp_mask);
+	
+	if (new_page) {
+		atomic_inc(&pmem_allocations);
+		printk(KERN_INFO "PMEM ALLOCATION - Total PMEM pages: %d\n", 
+		       atomic_read(&pmem_allocations));
+	}
+	
+	return new_page;
 }
 
 
@@ -244,7 +255,15 @@ struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 struct page* alloc_normal_page(struct page *page, unsigned long data)
 {
         gfp_t gfp_mask = GFP_USER;
-        return alloc_page(gfp_mask);
+        struct page *new_page = alloc_page(gfp_mask);
+        
+        if (new_page) {
+		atomic_inc(&dram_allocations);
+		printk(KERN_INFO "DRAM ALLOCATION - Total DRAM pages: %d\n", 
+		       atomic_read(&dram_allocations));
+	}
+	
+	return new_page;
 }
 
 /* probably needs removed */
@@ -253,7 +272,7 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 {
 	//node mask of pmem_node
 	//pass node mask into alloc pages
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	nodemask_t nodemask_test;
 	int nid;
@@ -280,7 +299,24 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 
 		nodemask = &nodemask_test;
 	}
-	return pt_alloc_pages(gfp_mask, order, preferred_nid, nodemask);
+	
+	struct page *page = pt_alloc_pages(gfp_mask, order, preferred_nid, nodemask);
+	
+	// Track the allocation
+	if (page) {
+		int page_nid = page_to_nid(page);
+		if (NODE_DATA(page_nid)->pm_node != 0) {
+			atomic_inc(&pmem_allocations);
+			printk(KERN_INFO "PMEM ALLOCATION via ktmm_alloc_pages - Total PMEM pages: %d\n", 
+			       atomic_read(&pmem_allocations));
+		} else {
+			atomic_inc(&dram_allocations);
+			printk(KERN_INFO "DRAM ALLOCATION via ktmm_alloc_pages - Total DRAM pages: %d\n", 
+			       atomic_read(&dram_allocations));
+		}
+	}
+	
+	return page;
 }
 
 
@@ -297,7 +333,7 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
  */
 static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return READ_ONCE(memcg->memory.elow) >=
 		page_counter_read(&memcg->memory);
@@ -313,7 +349,7 @@ static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
  */
 static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	return READ_ONCE(memcg->memory.emin) >=
 		page_counter_read(&memcg->memory);
@@ -332,7 +368,7 @@ static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
 static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
 			enum lru_list lru, unsigned long *nr_zone_taken)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	int zid;
 
@@ -355,7 +391,7 @@ static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
  */
 static inline bool ktmm_folio_evictable(struct folio *folio)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	bool ret;
 
@@ -376,11 +412,61 @@ static inline bool ktmm_folio_evictable(struct folio *folio)
  */
 static inline bool ktmm_folio_needs_release(struct folio *folio)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	struct address_space *mapping = folio_mapping(folio);
 
 	return folio_has_private(folio) || (mapping && mapping_release_always(mapping));
+}
+
+
+/**
+ * print_system_page_stats - print current system-wide page statistics
+ */
+static void print_system_page_stats(void)
+{
+	struct zone *zone;
+	struct pglist_data *pgdat;
+	unsigned long total_dram_pages = 0;
+	unsigned long total_pmem_pages = 0;
+
+	// Iterate through all nodes
+	for_each_online_pgdat(pgdat) {
+		for_each_zone(zone) {
+			if (pgdat->pm_node) {
+				// PMEM node
+				total_pmem_pages += zone->managed_pages;
+			} else {
+				// DRAM node
+				total_dram_pages += zone->managed_pages;
+			}
+		}
+	}
+	
+	printk(KERN_INFO "SYSTEM PAGE STATS - DRAM: %lu pages, PMEM: %lu pages\n",
+	       total_dram_pages, total_pmem_pages);
+}
+
+
+/**
+ * print_node_page_stats - print detailed statistics for a specific node
+ */
+static void print_node_page_stats(struct pglist_data *pgdat)
+{
+	struct zone *zone;
+	unsigned long node_total_pages = 0;
+	unsigned long node_free_pages = 0;
+	
+	for_each_zone(zone) {
+		node_total_pages += zone->managed_pages;
+		node_free_pages += zone->free_area[0].nr_free;
+	}
+	
+	printk(KERN_INFO "Node %d (%s) - Managed pages: %lu, Free pages: %lu\n",
+	       pgdat->node_id, 
+	       pgdat->pm_node ? "PMEM" : "DRAM",
+	       node_total_pages,
+	       node_free_pages);
 }
 
 
@@ -403,17 +489,15 @@ static void scan_promote_list(unsigned long nr_to_scan,
 				enum lru_list lru,
 				struct pglist_data *pgdat)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	unsigned long nr_taken;
 	unsigned long nr_scanned;
 	unsigned long nr_migrated = 0;
-	unsigned long dram_count = 0, pm_count = 0;
 	isolate_mode_t isolate_mode = 0;
 	LIST_HEAD(l_hold);
 	int file = is_file_lru(lru);
 	int nid = pgdat->node_id;
-	struct folio *folio_iter;
 
 	struct list_head *src = &lruvec->lists[lru];
 
@@ -437,18 +521,6 @@ static void scan_promote_list(unsigned long nr_to_scan,
 
 	pr_debug("pgdat %d scanned %lu on promote list", nid, nr_scanned);
 	pr_debug("pgdat %d taken %lu on promote list", nid, nr_taken);
-
-	/* COUNT DRAM vs PM PAGES */
-	list_for_each_entry(folio_iter, &l_hold, lru) {
-		int folio_nid = page_to_nid(&folio_iter->page);
-		if (folio_nid == pmem_node) {
-			pm_count += folio_nr_pages(folio_iter);
-		} else {
-			dram_count += folio_nr_pages(folio_iter);
-		}
-	}
-	printk(KERN_INFO "KTMM: [promote_list] Node %d - Scanned: %lu, Taken: %lu (DRAM: %lu pages, PM: %lu pages)\n",
-		nid, nr_scanned, nr_taken, dram_count, pm_count);
 
 	// if (nr_taken) {
 	// 	unsigned int succeeded;
@@ -499,12 +571,11 @@ static void scan_active_list(unsigned long nr_to_scan,
 				enum lru_list lru,
 				struct pglist_data *pgdat)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	unsigned long nr_taken;
 	unsigned long nr_scanned;
 	unsigned long vm_flags;
-	unsigned long dram_count = 0, pm_count = 0;
 	LIST_HEAD(l_hold);	// The folios which were snipped off
 	LIST_HEAD(l_active);
 	LIST_HEAD(l_inactive);
@@ -513,7 +584,6 @@ static void scan_active_list(unsigned long nr_to_scan,
 	unsigned nr_rotated = 0;
 	int file = is_file_lru(lru);
 	int nid = pgdat->node_id;
-	struct folio *folio_iter;
 	
 	//pr_info("scanning active list");
 
@@ -590,7 +660,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 		}
 
 		folio_clear_active(folio);	// we are de-activating
-		folio_set_workingset(folio);
+		folio_set_workingsset(folio);
 		list_add(&folio->lru, &l_inactive);
 	}
 
@@ -604,34 +674,6 @@ static void scan_active_list(unsigned long nr_to_scan,
 	pr_debug("pgdat %d folio activated: %d", nid, nr_activate);
 	pr_debug("pgdat %d folio deactivated: %d", nid, nr_deactivate);
 	pr_debug("pgdat %d folio promoted: %d", nid, nr_promote);
-
-	/* COUNT DRAM vs PM PAGES - iterate through all three lists */
-	list_for_each_entry(folio_iter, &l_active, lru) {
-		int folio_nid = page_to_nid(&folio_iter->page);
-		if (folio_nid == pmem_node) {
-			pm_count += folio_nr_pages(folio_iter);
-		} else {
-			dram_count += folio_nr_pages(folio_iter);
-		}
-	}
-	list_for_each_entry(folio_iter, &l_inactive, lru) {
-		int folio_nid = page_to_nid(&folio_iter->page);
-		if (folio_nid == pmem_node) {
-			pm_count += folio_nr_pages(folio_iter);
-		} else {
-			dram_count += folio_nr_pages(folio_iter);
-		}
-	}
-	list_for_each_entry(folio_iter, &l_promote, lru) {
-		int folio_nid = page_to_nid(&folio_iter->page);
-		if (folio_nid == pmem_node) {
-			pm_count += folio_nr_pages(folio_iter);
-		} else {
-			dram_count += folio_nr_pages(folio_iter);
-		}
-	}
-	printk(KERN_INFO "KTMM: [active_list] Node %d - Scanned: %lu, Taken: %lu (DRAM: %lu pages, PM: %lu pages) | Activated: %u, Deactivated: %u, Promoted: %u\n",
-		nid, nr_scanned, nr_taken, dram_count, pm_count, nr_activate, nr_deactivate, nr_promote);
 
 	// Keep all free folios in l_active list
 	list_splice(&l_inactive, &l_active);
@@ -667,17 +709,15 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 					enum lru_list lru,
 					struct pglist_data *pgdat)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	LIST_HEAD(folio_list);
 	unsigned long nr_scanned;
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
 	unsigned long nr_reclaimed = 0;
-	unsigned long dram_count = 0, pm_count = 0;
 	bool file = is_file_lru(lru);
 	int nid = pgdat->node_id;
-	struct folio *folio_iter;
 	//pr_info("scanning inactive list");
 
 	// make sure pages in per-cpu lru list are added
@@ -694,18 +734,6 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	spin_unlock_irq(&lruvec->lru_lock);
 
 	if (nr_taken == 0) return 0;
-
-	/* COUNT DRAM vs PM PAGES */
-	list_for_each_entry(folio_iter, &folio_list, lru) {
-		int folio_nid = page_to_nid(&folio_iter->page);
-		if (folio_nid == pmem_node) {
-			pm_count += folio_nr_pages(folio_iter);
-		} else {
-			dram_count += folio_nr_pages(folio_iter);
-		}
-	}
-	printk(KERN_INFO "KTMM: [inactive_list] Node %d - Scanned: %lu, Taken: %lu (DRAM: %lu pages, PM: %lu pages)\n",
-		nid, nr_scanned, nr_taken, dram_count, pm_count);
 
 	//migrate pages down to the pmem node
 	// if (pgdat->pm_node == 0 && pmem_node_id != -1) {
@@ -752,7 +780,7 @@ static unsigned long scan_list(enum lru_list lru,
 				struct scan_control *sc,
 				struct pglist_data *pgdat)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	if (is_active_lru(lru))
 		scan_active_list(nr_to_scan, lruvec, sc, lru, pgdat);
@@ -777,14 +805,22 @@ static void scan_node(pg_data_t *pgdat,
 		struct scan_control *sc,
 		struct mem_cgroup_reclaim_cookie *reclaim)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	enum lru_list lru;
 	struct mem_cgroup *memcg;
 	int nid = pgdat->node_id;
 	int memcg_count;
 
-	printk(KERN_INFO "KTMM: ===== Beginning scan on node %d =====\n", nid);
+	// Print scan statistics
+	int scan_count = atomic_inc_return(&total_scans);
+	printk(KERN_INFO "=== TMEMD SCAN #%d STARTED on node %d (type: %s) ===\n", 
+	       scan_count, nid, pgdat->pm_node ? "PMEM" : "DRAM");
+	printk(KERN_INFO "CURRENT TOTALS - DRAM pages: %d, PMEM pages: %d\n",
+	       atomic_read(&dram_allocations), atomic_read(&pmem_allocations));
+	
+	// Print detailed node statistics
+	print_node_page_stats(pgdat);
 
 	memset(&sc->nr, 0, sizeof(sc->nr));
 	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
@@ -828,8 +864,8 @@ static void scan_node(pg_data_t *pgdat,
 			scan_list(lru, nr_to_scan, lruvec, sc, pgdat);
 		}
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
-
-	printk(KERN_INFO "KTMM: ===== Completed scan on node %d =====\n\n", nid);
+	
+	printk(KERN_INFO "=== TMEMD SCAN #%d COMPLETED on node %d ===\n", scan_count, nid);
 }
 
 
@@ -848,7 +884,7 @@ static void scan_node(pg_data_t *pgdat,
  */
 static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	long remaining = 0;
 	DEFINE_WAIT(wait);
@@ -874,7 +910,7 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
  */
 static int tmemd(void *p) 
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
 	pg_data_t *pgdat = (pg_data_t *)p;
 	int nid = pgdat->node_id;
@@ -983,6 +1019,10 @@ int tmemd_start_available(void)
 
 	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
+	// Print initial system statistics
+	printk(KERN_INFO "=== TMEMD MODULE STARTING ===\n");
+	print_system_page_stats();
+	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
@@ -1008,6 +1048,13 @@ int tmemd_start_available(void)
 void tmemd_stop_all(void)
 {
 	int nid;
+
+	// Print final statistics
+	printk(KERN_INFO "=== TMEMD MODULE STOPPING ===\n");
+	printk(KERN_INFO "FINAL TOTALS - DRAM pages: %d, PMEM pages: %d, Total scans: %d\n",
+	       atomic_read(&dram_allocations), atomic_read(&pmem_allocations), 
+	       atomic_read(&total_scans));
+	print_system_page_stats();
 
 	for_each_online_node(nid)
 	{
