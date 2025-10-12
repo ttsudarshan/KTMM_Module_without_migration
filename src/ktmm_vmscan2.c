@@ -732,11 +732,15 @@ static void scan_node(pg_data_t *pgdat,
   struct scan_control *sc,
   struct mem_cgroup_reclaim_cookie *reclaim)
 {
-  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+ // printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
   enum lru_list lru;
   struct mem_cgroup *memcg;
   int nid = pgdat->node_id;
+
+  printk(KERN_INFO "sudarshan: Scanning Node %d (Type: %s)", nid, 
+    pgdat->pm_node ? "PMEM" : "DRAM");
+
   int memcg_count;
   
   /* ADD: Per-scan counters */
