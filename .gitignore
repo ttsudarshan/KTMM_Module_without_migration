@@ -1,0 +1,23 @@
+# build files and directories
+docs/_build/*
+build/*
+*.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.mod.cmd
+*.mod.o
+*.mod.o.cmd
+*.order
+*.order.cmd
+*.symvers
+*.symvers.cmd
+
+# editor settings
+.vscode/*
+.exrc
+.vimrc
+.nvimrc
+.nvim.lua
