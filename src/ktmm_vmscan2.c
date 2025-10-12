@@ -53,13 +53,10 @@ int pmem_node = -1;
 /* holds pointers to the tmemd daemons running per node */
 static struct task_struct *tmemd_list[MAX_NUMNODES];
 
+
 /* per node tmemd wait queues */
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
-/************** PAGE ALLOCATION TRACKING VARIABLES *************************/
-static atomic_t dram_allocations = ATOMIC_INIT(0);
-static atomic_t pmem_allocations = ATOMIC_INIT(0);
-static atomic_t total_scans = ATOMIC_INIT(0);
 
 /************** MISC HOOKED FUNCTION PROTOTYPES *****************************/
 static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
@@ -215,43 +212,7 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
 
 	return pt_folio_referenced(folio, is_locked, memcg, vm_flags);
 }
-/**
- * print_system_allocation_stats - print current system-wide allocation statistics
- */
-/**
- * print_system_allocation_stats - print current system-wide allocation statistics
- */
-static void print_system_allocation_stats(void)
-{
-	struct zone *zone;
-	struct pglist_data *pgdat;
-	unsigned long total_dram_allocated = 0;
-	unsigned long total_pmem_allocated = 0;
 
-	// Iterate through all nodes
-	for_each_online_pgdat(pgdat) {
-		unsigned long node_allocated = 0;
-		
-		for_each_zone(zone) {
-			// Calculate allocated pages: managed_pages - free_pages
-			unsigned long free_pages = zone_page_state(zone, NR_FREE_PAGES);
-			unsigned long managed_pages = zone->managed_pages.counter; // Use .counter for atomic_long_t
-			node_allocated += (managed_pages - free_pages);
-		}
-		
-		if (pgdat->pm_node) {
-			total_pmem_allocated += node_allocated;
-		} else {
-			total_dram_allocated += node_allocated;
-		}
-		
-		printk(KERN_INFO "Node %d (%s): %lu allocated pages\n",
-		       pgdat->node_id, pgdat->pm_node ? "PMEM" : "DRAM", node_allocated);
-	}
-	
-	printk(KERN_INFO "SYSTEM TOTAL - DRAM: %lu pages, PMEM: %lu pages\n",
-	       total_dram_allocated, total_pmem_allocated);
-}
 /*****************************************************************************
  * ALLOC & SWAP
  *****************************************************************************/
@@ -268,13 +229,7 @@ struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 {
   //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 	gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
-	struct page *new_page = alloc_page(gfp_mask);
-	
-	if (new_page) {
-		atomic_inc(&pmem_allocations);
-	}
-	
-	return new_page;
+	return alloc_page(gfp_mask);
 }
 
 
@@ -289,13 +244,7 @@ struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 struct page* alloc_normal_page(struct page *page, unsigned long data)
 {
         gfp_t gfp_mask = GFP_USER;
-        struct page *new_page = alloc_page(gfp_mask);
-        
-        if (new_page) {
-		atomic_inc(&dram_allocations);
-	}
-	
-	return new_page;
+        return alloc_page(gfp_mask);
 }
 
 /* probably needs removed */
@@ -304,7 +253,7 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 {
 	//node mask of pmem_node
 	//pass node mask into alloc pages
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: enter//ed %s\n", __func__);
 
 	nodemask_t nodemask_test;
 	int nid;
@@ -331,24 +280,7 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 
 		nodemask = &nodemask_test;
 	}
-	
-	struct page *page = pt_alloc_pages(gfp_mask, order, preferred_nid, nodemask);
-	
-	// Track the allocation
-	if (page) {
-		int page_nid = page_to_nid(page);
-		if (NODE_DATA(page_nid)->pm_node != 0) {
-			atomic_inc(&pmem_allocations);
-			printk(KERN_INFO "ALLOCATION: PMEM page allocated on node %d, total PMEM: %d\n",
-			       page_nid, atomic_read(&pmem_allocations));
-		} else {
-			atomic_inc(&dram_allocations);
-			printk(KERN_INFO "ALLOCATION: DRAM page allocated on node %d, total DRAM: %d\n",
-			       page_nid, atomic_read(&dram_allocations));
-		}
-	}
-	
-	return page;
+	return pt_alloc_pages(gfp_mask, order, preferred_nid, nodemask);
 }
 
 
@@ -453,19 +385,6 @@ static inline bool ktmm_folio_needs_release(struct folio *folio)
 
 
 /**
- * print_allocation_stats - print current allocation statistics
- */
-// static void print_allocation_stats(struct pglist_data *pgdat)
-// {
-// 	printk(KERN_INFO "ALLOCATION STATS - Node %d (%s): DRAM pages: %d, PMEM pages: %d\n",
-// 	       pgdat->node_id, 
-// 	       pgdat->pm_node ? "PMEM" : "DRAM",
-// 	       atomic_read(&dram_allocations), 
-// 	       atomic_read(&pmem_allocations));
-// }
-
-
-/**
  * scan_promote_list - scan promote lru folios for migration
  *
  * @nr_to_scan:		number to scan
@@ -517,7 +436,18 @@ static void scan_promote_list(unsigned long nr_to_scan,
 	pr_debug("pgdat %d scanned %lu on promote list", nid, nr_scanned);
 	pr_debug("pgdat %d taken %lu on promote list", nid, nr_taken);
 
-	//dummy code
+	// if (nr_taken) {
+	// 	unsigned int succeeded;
+	// 	int ret = migrate_pages(&l_hold, alloc_normal_page,
+	// 			NULL, 0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
+	// 	nr_migrated = (ret < 0 ? 0 : nr_taken - ret);
+	// 	__mod_node_page_state(pgdat, NR_PROMOTED, nr_migrated);
+
+	// 	pr_debug("pgdat %d migrated %lu folios from promote list", nid, nr_migrated);
+	// }
+  
+
+  //dummy code
   if (nr_taken) {
     nr_migrated = 0;  // No migration actually happens
     pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from promote list", nid, nr_taken);
@@ -699,7 +629,7 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_scanned;
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
-	//unsigned long nr_reclaimed = 0;
+	unsigned long nr_reclaimed = 0;
 	bool file = is_file_lru(lru);
 	int nid = pgdat->node_id;
 	//pr_info("scanning inactive list");
@@ -719,7 +649,16 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 	if (nr_taken == 0) return 0;
 
-	//dummy code
+	//migrate pages down to the pmem node
+	// if (pgdat->pm_node == 0 && pmem_node_id != -1) {
+	// 	unsigned int succeeded;
+	// 	int ret = migrate_pages(&folio_list, alloc_pmem_page, NULL, 
+	// 				0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
+	// 	nr_migrated = (ret >= 0 ? nr_taken - ret : 0);
+	// 	pr_debug("pgdat %d migrated %lu folios from inactive list", nid, nr_migrated);
+	// 	__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
+	// }
+//dummy code
   if (pgdat->pm_node == 0 && pmem_node_id != -1) {
     nr_migrated = 0;  // No migration actually happens
     pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from inactive list", nid, nr_taken);
@@ -785,12 +724,10 @@ static void scan_node(pg_data_t *pgdat,
 	enum lru_list lru;
 	struct mem_cgroup *memcg;
 	int nid = pgdat->node_id;
-	int memcg_count;
 
-	// Print allocation statistics at the start of each scan
-	int scan_count = atomic_inc_return(&total_scans);
-	printk(KERN_INFO "=== TMEMD SCAN #%d STARTED ===\n", scan_count);
-	print_system_allocation_stats();
+  printk(KERN_INFO "sudarshan: Scanning Node %d (Type: %s)", nid, 
+    pgdat->pm_node ? "PMEM" : "DRAM");
+	int memcg_count;
 
 	memset(&sc->nr, 0, sizeof(sc->nr));
 	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
@@ -987,11 +924,6 @@ int tmemd_start_available(void)
 
 	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
-	// Print initial allocation state
-	printk(KERN_INFO "TMEMD INIT - Starting allocation tracking\n");
-	printk(KERN_INFO "INITIAL STATE - DRAM pages: %d, PMEM pages: %d\n",
-	       atomic_read(&dram_allocations), atomic_read(&pmem_allocations));
-	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
@@ -1018,11 +950,6 @@ void tmemd_stop_all(void)
 {
 	int nid;
 
-	// Print final allocation state
-	printk(KERN_INFO "TMEMD FINAL - DRAM pages: %d, PMEM pages: %d, Total scans: %d\n",
-	       atomic_read(&dram_allocations), atomic_read(&pmem_allocations), 
-	       atomic_read(&total_scans));
-
 	for_each_online_node(nid)
 	{
 		kthread_stop(tmemd_list[nid]);
@@ -1030,3 +957,5 @@ void tmemd_stop_all(void)
 
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
+
+
