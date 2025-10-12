@@ -47,8 +47,13 @@
 // possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
 
-// which node is the pmem node
+/// which node is the pmem node
 int pmem_node = -1;
+
+/* Add these global counters */
+static unsigned long total_dram_pages_scanned = 0;
+static unsigned long total_pmem_pages_scanned = 0;
+static unsigned long scan_cycle_count = 0;
 
 /* holds pointers to the tmemd daemons running per node */
 static struct task_struct *tmemd_list[MAX_NUMNODES];
@@ -674,7 +679,7 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	ktmm_cgroup_uncharge_list(&folio_list);
 	ktmm_free_unref_page_list(&folio_list);
 
-	return nr_migrated;
+  return nr_taken;  // Return actual pages found
 }
 
 
@@ -689,20 +694,28 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
  * @pgdat:		node data
  */
 static unsigned long scan_list(enum lru_list lru, 
-				unsigned long nr_to_scan,
-				struct lruvec *lruvec, 
-				struct scan_control *sc,
-				struct pglist_data *pgdat)
+  unsigned long nr_to_scan,
+  struct lruvec *lruvec, 
+  struct scan_control *sc,
+  struct pglist_data *pgdat)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
-	if (is_active_lru(lru))
-		scan_active_list(nr_to_scan, lruvec, sc, lru, pgdat);
+unsigned long pages_found = 0;
 
-	if(is_promote_lru(lru))
-		scan_promote_list(nr_to_scan, lruvec, sc, lru, pgdat);
+if (is_active_lru(lru)) {
+  scan_active_list(nr_to_scan, lruvec, sc, lru, pgdat);
+  pages_found += nr_to_scan;  // Track that we scanned this many
+}
 
-	return scan_inactive_list(nr_to_scan, lruvec, sc, lru, pgdat);
+if(is_promote_lru(lru)) {
+  scan_promote_list(nr_to_scan, lruvec, sc, lru, pgdat);
+  pages_found += nr_to_scan;  // Track that we scanned this many
+}
+
+pages_found += scan_inactive_list(nr_to_scan, lruvec, sc, lru, pgdat);
+
+return pages_found;
 }
 
 
@@ -716,61 +729,64 @@ static unsigned long scan_list(enum lru_list lru,
  * This is responsible for scanning the lruvec per memory cgroup.
  */
 static void scan_node(pg_data_t *pgdat, 
-		struct scan_control *sc,
-		struct mem_cgroup_reclaim_cookie *reclaim)
+  struct scan_control *sc,
+  struct mem_cgroup_reclaim_cookie *reclaim)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+  printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 
-	enum lru_list lru;
-	struct mem_cgroup *memcg;
-	int nid = pgdat->node_id;
+  enum lru_list lru;
+  struct mem_cgroup *memcg;
+  int nid = pgdat->node_id;
+  int memcg_count;
+  
+  /* ADD: Per-scan counters */
+  unsigned long node_pages_scanned = 0;
 
-  printk(KERN_INFO "sudarshan: Scanning Node %d (Type: %s)", nid, 
-    pgdat->pm_node ? "PMEM" : "DRAM");
-	int memcg_count;
+  memset(&sc->nr, 0, sizeof(sc->nr));
+  memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
+  sc->target_mem_cgroup = memcg;
 
-	memset(&sc->nr, 0, sizeof(sc->nr));
-	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
-	sc->target_mem_cgroup = memcg;
+  //pr_info("scanning lists on node %d", nid);
+  memcg_count = 0;
+  do {
+      struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
+      unsigned long reclaimed;
+      unsigned long scanned;
 
-	//pr_info("scanning lists on node %d", nid);
-	memcg_count = 0;
-	do {
-		struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
-		unsigned long reclaimed;
-		unsigned long scanned;
+      memcg_count += 1;
 
-		memcg_count += 1;
+      if (ktmm_cgroup_below_min(memcg)) {
+          continue;
+      } else if (ktmm_cgroup_below_low(memcg)) {
+          if (!sc->memcg_low_reclaim) {
+              sc->memcg_low_skipped = 1;
+              continue;
+          }
+      }
 
-		if (ktmm_cgroup_below_min(memcg)) {
-			/*
-			 * Hard protection.
-			 * If there is no reclaimable memory, OOM.
-			 */
-			continue;
-		} else if (ktmm_cgroup_below_low(memcg)) {
-			/*
-			 * Soft protection.
-			 * Respect the protection only as long as
-			 * there is an unprotected supply of 
-			 * reclaimable memory from other cgroups.
-			 */
-			if (!sc->memcg_low_reclaim) {
-				sc->memcg_low_skipped = 1;
-				continue;
-			}
-			// memcg_memory_event(memcg, MEMCG_LOW);
-		}
+      reclaimed = sc->nr_reclaimed;
+      scanned = sc->nr_scanned;
 
-		reclaimed = sc->nr_reclaimed;
-		scanned = sc->nr_scanned;
+      for_each_evictable_lru(lru) {
+          unsigned long nr_to_scan = 32;
+          unsigned long pages_found = scan_list(lru, nr_to_scan, lruvec, sc, pgdat);
+          node_pages_scanned += pages_found;  // Track pages found in this scan
+      }
+  } while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 
-		for_each_evictable_lru(lru) {
-			unsigned long nr_to_scan = 32;  //sudarshan changed this to 32 from 1024
-
-			scan_list(lru, nr_to_scan, lruvec, sc, pgdat);
-		}
-	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
+  /* ADD: Update global counters and print summary */
+  if (pgdat->pm_node) {
+      total_pmem_pages_scanned += node_pages_scanned;
+  } else {
+      total_dram_pages_scanned += node_pages_scanned;
+  }
+  
+  printk(KERN_INFO "=== SCAN CYCLE %lu SUMMARY ===\n", ++scan_cycle_count);
+  printk(KERN_INFO "Node %d (%s): %lu pages scanned this cycle\n", 
+         nid, pgdat->pm_node ? "PMEM" : "DRAM", node_pages_scanned);
+  printk(KERN_INFO "TOTAL DRAM pages scanned: %lu\n", total_dram_pages_scanned);
+  printk(KERN_INFO "TOTAL PMEM pages scanned: %lu\n", total_pmem_pages_scanned);
+  printk(KERN_INFO "==============================\n");
 }
 
 
