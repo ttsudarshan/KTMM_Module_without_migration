@@ -215,7 +215,40 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
 
 	return pt_folio_referenced(folio, is_locked, memcg, vm_flags);
 }
+/**
+ * print_system_allocation_stats - print current system-wide allocation statistics
+ */
+static void print_system_allocation_stats(void)
+{
+	struct zone *zone;
+	struct pglist_data *pgdat;
+	unsigned long total_dram_allocated = 0;
+	unsigned long total_pmem_allocated = 0;
 
+	// Iterate through all nodes
+	for_each_online_pgdat(pgdat) {
+		unsigned long node_allocated = 0;
+		
+		for_each_zone(zone) {
+			// Calculate allocated pages: managed_pages - free_pages
+			unsigned long free_pages = zone_page_state(zone, NR_FREE_PAGES);
+			unsigned long managed_pages = zone->managed_pages;
+			node_allocated += (managed_pages - free_pages);
+		}
+		
+		if (pgdat->pm_node) {
+			total_pmem_allocated += node_allocated;
+		} else {
+			total_dram_allocated += node_allocated;
+		}
+		
+		printk(KERN_INFO "Node %d (%s): %lu allocated pages\n",
+		       pgdat->node_id, pgdat->pm_node ? "PMEM" : "DRAM", node_allocated);
+	}
+	
+	printk(KERN_INFO "SYSTEM TOTAL - DRAM: %lu pages, PMEM: %lu pages\n",
+	       total_dram_allocated, total_pmem_allocated);
+}
 /*****************************************************************************
  * ALLOC & SWAP
  *****************************************************************************/
@@ -303,8 +336,12 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 		int page_nid = page_to_nid(page);
 		if (NODE_DATA(page_nid)->pm_node != 0) {
 			atomic_inc(&pmem_allocations);
+			printk(KERN_INFO "ALLOCATION: PMEM page allocated on node %d, total PMEM: %d\n",
+			       page_nid, atomic_read(&pmem_allocations));
 		} else {
 			atomic_inc(&dram_allocations);
+			printk(KERN_INFO "ALLOCATION: DRAM page allocated on node %d, total DRAM: %d\n",
+			       page_nid, atomic_read(&dram_allocations));
 		}
 	}
 	
@@ -749,9 +786,8 @@ static void scan_node(pg_data_t *pgdat,
 
 	// Print allocation statistics at the start of each scan
 	int scan_count = atomic_inc_return(&total_scans);
-	printk(KERN_INFO "TMEMD SCAN #%d - Node %d (%s): DRAM=%d, PMEM=%d\n", 
-	       scan_count, nid, pgdat->pm_node ? "PMEM" : "DRAM",
-	       atomic_read(&dram_allocations), atomic_read(&pmem_allocations));
+	printk(KERN_INFO "=== TMEMD SCAN #%d STARTED ===\n", scan_count);
+	print_system_allocation_stats();
 
 	memset(&sc->nr, 0, sizeof(sc->nr));
 	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
