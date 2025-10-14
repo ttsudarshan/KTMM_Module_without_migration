@@ -258,7 +258,7 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 {
 	//node mask of pmem_node
 	//pass node mask into alloc pages
-  printk(KERN_INFO "sudarshan: enter//ed %s\n", __func__);
+  //printk(KERN_INFO "sudarshan: enter//ed %s\n", __func__);
 
 	nodemask_t nodemask_test;
 	int nid;
