@@ -984,4 +984,4 @@ void tmemd_stop_all(void)
 	}
 
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
-}g
+}
