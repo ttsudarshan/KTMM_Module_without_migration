@@ -157,7 +157,8 @@ static inline void log_page_scan(struct folio *folio, enum lru_list lru,
 	time_ms = jiffies_to_msecs(current_jiffies);
 
 	/* Fill in the log entry */
-	log_entry->page_addr = page_to_phys(&folio->page);
+	/* Use page_to_pfn and PAGE_SHIFT for portable physical address calculation */
+	log_entry->page_addr = (unsigned long)page_to_pfn(&folio->page) << PAGE_SHIFT;
 	log_entry->kaddr = (unsigned long)folio_address(folio);
 	log_entry->timestamp = current_jiffies;
 	log_entry->timestamp_ms = time_ms;
