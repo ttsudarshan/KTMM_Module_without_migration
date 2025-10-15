@@ -47,6 +47,11 @@
 // possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
 
+// KTMM: Macro for page access tracking
+#define PRINT_PAGE_ACCESS(page_addr, node_type) \
+	printk(KERN_INFO "PAGE_ACCESS | Addr: %p | Jiffies: %lu | Node: %s\n", \
+		(void *)(page_addr), jiffies, (node_type == 0) ? "DRAM" : "PMEM")
+
 // which node is the pmem node
 int pmem_node = -1;
 
@@ -428,7 +433,18 @@ static void scan_promote_list(unsigned long nr_to_scan,
 	spin_lock_irq(&lruvec->lru_lock);
 
 	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
-					&nr_scanned, sc, lru);
+				&nr_scanned, sc, lru);
+
+	/* KTMM: Track pages being scanned on promote list */
+	if (nr_taken > 0) {
+		struct folio *folio;
+		list_for_each_entry(folio, &l_hold, lru) {
+			unsigned long page_addr = (unsigned long)folio_address(folio);
+			int node_type = pgdat->pm_node;  /* 0 for DRAM, 1 for PMEM */
+			PRINT_PAGE_ACCESS(page_addr, node_type);
+		}
+	}
+
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
 	spin_unlock_irq(&lruvec->lru_lock);
@@ -519,6 +535,11 @@ static void scan_active_list(unsigned long nr_to_scan,
 		cond_resched();
 		folio = lru_to_folio(&l_hold);
 		list_del(&folio->lru);
+
+		/* KTMM: Track page access */
+		unsigned long page_addr = (unsigned long)folio_address(folio);
+		int node_type = pgdat->pm_node;  /* 0 for DRAM, 1 for PMEM */
+		PRINT_PAGE_ACCESS(page_addr, node_type);
 
 		if (unlikely(!ktmm_folio_evictable(folio))) {
 			ktmm_folio_putback_lru(folio);
@@ -642,6 +663,16 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
+
+	/* KTMM: Track pages being scanned on inactive list */
+	if (nr_taken > 0) {
+		struct folio *folio;
+		list_for_each_entry(folio, &folio_list, lru) {
+			unsigned long page_addr = (unsigned long)folio_address(folio);
+			int node_type = pgdat->pm_node;  /* 0 for DRAM, 1 for PMEM */
+			PRINT_PAGE_ACCESS(page_addr, node_type);
+		}
+	}
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
@@ -954,5 +985,3 @@ void tmemd_stop_all(void)
 
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
-
-
