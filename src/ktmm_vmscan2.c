@@ -19,9 +19,10 @@
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
+#include <linux/mm.h>        /* ADD: For page operations */
 #include <linux/module.h>
 #include <linux/memcontrol.h>
-#include <linux/jiffies.h>  /* ADD: For jiffies_to_msecs() */
+#include <linux/jiffies.h>   /* ADD: For jiffies_to_msecs() */
 //#include <linux/mmflags.h>
 #include <linux/mmzone.h>
 #include <linux/mm_inline.h>
