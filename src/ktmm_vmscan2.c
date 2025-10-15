@@ -21,6 +21,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/memcontrol.h>
+#include <linux/jiffies.h>  /* ADD: For jiffies_to_msecs() */
 //#include <linux/mmflags.h>
 #include <linux/mmzone.h>
 #include <linux/mm_inline.h>
@@ -58,163 +59,238 @@ static unsigned long scan_cycle_count = 0;
 /* holds pointers to the tmemd daemons running per node */
 static struct task_struct *tmemd_list[MAX_NUMNODES];
 
-
 /* per node tmemd wait queues */
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
+/*****************************************************************************
+ * PER-PAGE SCAN TRACKING - ENHANCED WITH MILLISECOND TIMESTAMPS
+ *****************************************************************************/
+
+/* Per-page scan tracking */
+#define MAX_PAGE_LOG_ENTRIES 10000
+
+struct page_scan_log {
+	unsigned long page_addr;      /* Physical address of page */
+	unsigned long kaddr;          /* Kernel virtual address */
+	unsigned long timestamp;      /* jiffies when scanned */
+	u64 timestamp_ms;             /* Real time in milliseconds */
+	int node_id;                  /* Node ID (0=DRAM, 1+=PMEM) */
+	char node_type[8];            /* "DRAM" or "PMEM" string */
+	enum lru_list lru_type;       /* Which LRU list it came from */
+	unsigned long folio_flags;    /* Folio flags at scan time */
+};
+
+/* Circular buffer for page scan logs */
+static struct page_scan_log page_log[MAX_PAGE_LOG_ENTRIES];
+static atomic_t page_log_index = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(page_log_lock);
 
 /************** MISC HOOKED FUNCTION PROTOTYPES *****************************/
 static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim);
-
+			struct mem_cgroup *prev,
+			struct mem_cgroup_reclaim_cookie *reclaim);
 
 static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
-					unsigned int order,
-					unsigned long mark,
-					int highest_zoneidx);
-
+				unsigned int order,
+				unsigned long mark,
+				int highest_zoneidx);
 
 static struct pglist_data *(*pt_first_online_pgdat)(void);
 
-
 static struct zone *(*pt_next_zone)(struct zone *zone);
-
 
 static void (*pt_free_unref_page_list)(struct list_head *list);
 
-
 static void (*pt_lru_add_drain)(void);
 
-
 static void (*pt_cgroup_update_lru_size)(struct lruvec *lruvec, enum lru_list lru,
-					int zid, int nr_pages);
-
+				int zid, int nr_pages);
 
 static void (*pt_cgroup_uncharge_list)(struct list_head *page_list);
 
-
 static unsigned long (*pt_isolate_lru_folios)(unsigned long nr_to_scan, struct lruvec *lruvec,
-					struct list_head *dst, unsigned long *nr_scanned,
-					struct scan_control *sc, enum lru_list lru);
-
+				struct list_head *dst, unsigned long *nr_scanned,
+				struct scan_control *sc, enum lru_list lru);
 
 static unsigned int (*pt_move_folios_to_lru)(struct lruvec *lruvec, struct list_head *list);
 
-
 static void (*pt_folio_putback_lru)(struct folio *folio);
 
-
 static int (*pt_folio_referenced)(struct folio *folio, int is_locked,
-				struct mem_cgroup *memcg, unsigned long *vm_flags);
-
+			struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 /* __alloc_pages (page_alloc.c) */
 /* probably needs removed */
 static struct page *(*pt_alloc_pages)(gfp_t gfp_mask, unsigned int order, int preferred_nid,
-					nodemask_t *nodemask);
+				nodemask_t *nodemask);
 
+/*****************************************************************************
+ * LOG PAGE SCAN HELPER FUNCTION
+ *****************************************************************************/
+
+/**
+ * log_page_scan - Log individual page scan details with millisecond timestamps
+ *
+ * @folio:      folio being scanned
+ * @lru:        LRU list type
+ * @pgdat:      node data
+ *
+ * This function records page address, timestamp, and node information
+ */
+static inline void log_page_scan(struct folio *folio, enum lru_list lru, 
+				 struct pglist_data *pgdat)
+{
+	unsigned long idx;
+	struct page_scan_log *log_entry;
+	unsigned long flags;
+	unsigned long current_jiffies;
+	u64 time_ms;
+
+	spin_lock_irqsave(&page_log_lock, flags);
+
+	/* Get next index in circular buffer */
+	idx = atomic_inc_return(&page_log_index) % MAX_PAGE_LOG_ENTRIES;
+	log_entry = &page_log[idx];
+
+	current_jiffies = jiffies;
+	time_ms = jiffies_to_msecs(current_jiffies);
+
+	/* Fill in the log entry */
+	log_entry->page_addr = page_to_phys(&folio->page);
+	log_entry->kaddr = (unsigned long)folio_address(folio);
+	log_entry->timestamp = current_jiffies;
+	log_entry->timestamp_ms = time_ms;
+	log_entry->node_id = pgdat->node_id;
+	log_entry->lru_type = lru;
+	log_entry->folio_flags = folio->flags;
+
+	/* Set node type string */
+	if (pgdat->pm_node) {
+		strncpy(log_entry->node_type, "PMEM", 7);
+	} else {
+		strncpy(log_entry->node_type, "DRAM", 7);
+	}
+	log_entry->node_type[7] = '\0';
+
+	/* Print immediately with millisecond timestamp */
+	printk(KERN_INFO 
+		"[PAGE_SCAN] PhysAddr=0x%lx | Time=%llu ms | "
+		"Node=%s(%d) | LRU=%d | Flags=0x%lx\n",
+		log_entry->page_addr,
+		time_ms,
+		log_entry->node_type,
+		log_entry->node_id,
+		lru,
+		log_entry->folio_flags);
+
+	spin_unlock_irqrestore(&page_log_lock, flags);
+}
+
+/**
+ * dump_page_scan_log - Print entire page scan log buffer
+ *
+ * Useful for debugging and analysis
+ */
+void dump_page_scan_log(void)
+{
+	int i;
+	unsigned long flags;
+	struct page_scan_log *log_entry;
+
+	spin_lock_irqsave(&page_log_lock, flags);
+
+	printk(KERN_INFO "========== PAGE SCAN LOG DUMP ==========\n");
+	printk(KERN_INFO "Total entries logged: %d\n", atomic_read(&page_log_index));
+
+	for (i = 0; i < MAX_PAGE_LOG_ENTRIES; i++) {
+		log_entry = &page_log[i];
+
+		if (log_entry->page_addr == 0)  /* Skip empty entries */
+			continue;
+
+		printk(KERN_INFO 
+			"[%5d] PhysAddr=0x%lx | Time=%llu ms | "
+			"Node=%s(%d) | LRU=%d\n",
+			i,
+			log_entry->page_addr,
+			log_entry->timestamp_ms,
+			log_entry->node_type,
+			log_entry->node_id,
+			log_entry->lru_type);
+	}
+
+	printk(KERN_INFO "========================================\n");
+	spin_unlock_irqrestore(&page_log_lock, flags);
+}
+EXPORT_SYMBOL(dump_page_scan_log);
 
 /**************** KTMM IMPLEMENTATION OF HOOKED FUNCTION **********************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim)
+			struct mem_cgroup *prev,
+			struct mem_cgroup_reclaim_cookie *reclaim)
 {
 	return pt_mem_cgroup_iter(root, prev, reclaim);
 }
 
-
 static bool ktmm_zone_watermark_ok_safe(struct zone *z,
-					unsigned int order,
-					unsigned long mark,
-					int highest_zoneidx)
+				unsigned int order,
+				unsigned long mark,
+				int highest_zoneidx)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_zone_watermark_ok_safe(z, order, mark, highest_zoneidx);
 }
 
-
 static struct pglist_data *ktmm_first_online_pgdat(void)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_first_online_pgdat();
 }
 
-
 static struct zone *ktmm_next_zone(struct zone *zone)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_next_zone(zone);
 }
 
-
 static void ktmm_free_unref_page_list(struct list_head *list)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_free_unref_page_list(list);
 }
 
-
 static void ktmm_lru_add_drain(void)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	pt_lru_add_drain();
 }
 
-
 static void ktmm_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
-					int zid, int nr_pages)
+				int zid, int nr_pages)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	pt_cgroup_update_lru_size(lruvec, lru, zid, nr_pages);
 }
 
-
 static void ktmm_cgroup_uncharge_list(struct list_head *page_list)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	pt_cgroup_uncharge_list(page_list);
 }
 
-
 static unsigned long ktmm_isolate_lru_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
-					struct list_head *dst, unsigned long *nr_scanned,
-					struct scan_control *sc, enum lru_list lru)
+				struct list_head *dst, unsigned long *nr_scanned,
+				struct scan_control *sc, enum lru_list lru)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_isolate_lru_folios(nr_to_scan, lruvec, dst, nr_scanned, sc, lru);
 }
 
-
 static unsigned int ktmm_move_folios_to_lru(struct lruvec *lruvec, struct list_head *list)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_move_folios_to_lru(lruvec, list);
 }
 
-
 static void ktmm_folio_putback_lru(struct folio *folio)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	pt_folio_putback_lru(folio);
 }
 
-
 static int ktmm_folio_referenced(struct folio *folio, int is_locked,
-				struct mem_cgroup *memcg, unsigned long *vm_flags)
+			struct mem_cgroup *memcg, unsigned long *vm_flags)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return pt_folio_referenced(folio, is_locked, memcg, vm_flags);
 }
 
@@ -232,11 +308,9 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
  */
 struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
 	gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
 	return alloc_page(gfp_mask);
 }
-
 
 /**
  * alloc_normal_page - allocate a page on a normal node
@@ -248,18 +322,14 @@ struct page* alloc_pmem_page(struct  page *page, unsigned long data)
  */
 struct page* alloc_normal_page(struct page *page, unsigned long data)
 {
-        gfp_t gfp_mask = GFP_USER;
-        return alloc_page(gfp_mask);
+	gfp_t gfp_mask = GFP_USER;
+	return alloc_page(gfp_mask);
 }
 
 /* probably needs removed */
 static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int preferred_nid,
-					nodemask_t *nodemask)
+				nodemask_t *nodemask)
 {
-	//node mask of pmem_node
-	//pass node mask into alloc pages
-  //printk(KERN_INFO "sudarshan: enter//ed %s\n", __func__);
-
 	nodemask_t nodemask_test;
 	int nid;
 	
@@ -288,7 +358,6 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 	return pt_alloc_pages(gfp_mask, order, preferred_nid, nodemask);
 }
 
-
 /*****************************************************************************
  * Node Scanning, Shrinking, and Promotion
  *****************************************************************************/
@@ -302,12 +371,9 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
  */
 static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return READ_ONCE(memcg->memory.elow) >=
 		page_counter_read(&memcg->memory);
 }
-
 
 /**
  * ktmm_cgroup_below_min - if memory cgroup is below min memory thresh
@@ -318,12 +384,9 @@ static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
  */
 static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	return READ_ONCE(memcg->memory.emin) >=
 		page_counter_read(&memcg->memory);
 }
-
 
 /**
  * ktmm_update_lru_sizes - updates the size of the lru list
@@ -335,10 +398,8 @@ static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
  * This is a reimplementation from the kernel function.
  */
 static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
-			enum lru_list lru, unsigned long *nr_zone_taken)
+		enum lru_list lru, unsigned long *nr_zone_taken)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	int zid;
 
 	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
@@ -347,9 +408,7 @@ static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
 
 		ktmm_cgroup_update_lru_size(lruvec, lru, zid, -nr_zone_taken[zid]);
 	}
-
 }
-
 
 /**
  * ktmm_folio_evictable - if the folio is evictable or not
@@ -360,8 +419,6 @@ static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
  */
 static inline bool ktmm_folio_evictable(struct folio *folio)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	bool ret;
 
 	rcu_read_lock();
@@ -370,7 +427,6 @@ static inline bool ktmm_folio_evictable(struct folio *folio)
 	rcu_read_unlock();
 	return ret;
 }
-
 
 /**
  * ktmm_folio_needs_release - if the folio needs release before free
@@ -381,79 +437,9 @@ static inline bool ktmm_folio_evictable(struct folio *folio)
  */
 static inline bool ktmm_folio_needs_release(struct folio *folio)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	struct address_space *mapping = folio_mapping(folio);
 
 	return folio_has_private(folio) || (mapping && mapping_release_always(mapping));
-}
-
-
-/**
- * scan_promote_list - scan promote lru folios for migration
- *
- * @nr_to_scan:		number to scan
- * @lruvec:		target lruvec
- * @sc:			scan control
- * @lru:		lru list to scan
- * @pgdat:		node data
- *
- * Returns: number of pages actually scanned
- */
-static unsigned long scan_promote_list(unsigned long nr_to_scan,
-  struct lruvec *lruvec,
-  struct scan_control *sc,
-  enum lru_list lru,
-  struct pglist_data *pgdat)
-{
-//printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
-unsigned long nr_taken;
-unsigned long nr_scanned;
-unsigned long nr_migrated = 0;
-isolate_mode_t isolate_mode = 0;
-LIST_HEAD(l_hold);
-int file = is_file_lru(lru);
-int nid = pgdat->node_id;
-
-struct list_head *src = &lruvec->lists[lru];
-
-if (list_empty(src))
-  pr_debug("promote list empty");
-
-if (!sc->may_unmap)
-  isolate_mode |= ISOLATE_UNMAPPED;
-
-ktmm_lru_add_drain();
-
-spin_lock_irq(&lruvec->lru_lock);
-
-nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
-              &nr_scanned, sc, lru);
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
-
-spin_unlock_irq(&lruvec->lru_lock);
-
-pr_debug("pgdat %d scanned %lu on promote list", nid, nr_scanned);
-pr_debug("pgdat %d taken %lu on promote list", nid, nr_taken);
-
-//dummy code - migration disabled
-if (nr_taken) {
-  nr_migrated = 0;
-  pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from promote list", nid, nr_taken);
-}
-
-spin_lock_irq(&lruvec->lru_lock);
-
-ktmm_move_folios_to_lru(lruvec, &l_hold);
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
-
-spin_unlock_irq(&lruvec->lru_lock);
-
-ktmm_cgroup_uncharge_list(&l_hold);
-ktmm_free_unref_page_list(&l_hold);
-
-return nr_scanned;
 }
 
 /**
@@ -468,115 +454,109 @@ return nr_scanned;
  * Returns: number of pages actually scanned
  */
 static unsigned long scan_active_list(unsigned long nr_to_scan,
-  struct lruvec *lruvec,
-  struct scan_control *sc,
-  enum lru_list lru,
-  struct pglist_data *pgdat)
+	struct lruvec *lruvec,
+	struct scan_control *sc,
+	enum lru_list lru,
+	struct pglist_data *pgdat)
 {
-//printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+	unsigned long nr_taken;
+	unsigned long nr_scanned;
+	unsigned long vm_flags;
+	LIST_HEAD(l_hold);	// The folios which were snipped off
+	LIST_HEAD(l_active);
+	LIST_HEAD(l_inactive);
+	LIST_HEAD(l_promote);
+	unsigned nr_deactivate, nr_activate, nr_promote;
+	unsigned nr_rotated = 0;
+	int file = is_file_lru(lru);
+	int nid = pgdat->node_id;
 
-unsigned long nr_taken;
-unsigned long nr_scanned;
-unsigned long vm_flags;
-LIST_HEAD(l_hold);	// The folios which were snipped off
-LIST_HEAD(l_active);
-LIST_HEAD(l_inactive);
-LIST_HEAD(l_promote);
-unsigned nr_deactivate, nr_activate, nr_promote;
-unsigned nr_rotated = 0;
-int file = is_file_lru(lru);
-int nid = pgdat->node_id;
+	// make sure pages in per-cpu lru list are added
+	ktmm_lru_add_drain();
 
-//pr_info("scanning active list");
+	spin_lock_irq(&lruvec->lru_lock);
 
-// make sure pages in per-cpu lru list are added
-ktmm_lru_add_drain();
+	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
+				   &nr_scanned, sc, lru);
 
-spin_lock_irq(&lruvec->lru_lock);
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
-nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
-                   &nr_scanned, sc, lru);
+	spin_unlock_irq(&lruvec->lru_lock);
 
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	// Store the actual number scanned for return
+	unsigned long actual_scanned = nr_scanned;
 
-spin_unlock_irq(&lruvec->lru_lock);
+	while (!list_empty(&l_hold)) {
+		struct folio *folio;
 
-// Store the actual number scanned for return
-unsigned long actual_scanned = nr_scanned;
+		cond_resched();
+		folio = lru_to_folio(&l_hold);
+		list_del(&folio->lru);
 
-while (!list_empty(&l_hold)) {
-  struct folio *folio;
+		/* LOG PAGE SCAN */
+		log_page_scan(folio, lru, pgdat);
 
-  cond_resched();
-  folio = lru_to_folio(&l_hold);
-  list_del(&folio->lru);
+		if (unlikely(!ktmm_folio_evictable(folio))) {
+			ktmm_folio_putback_lru(folio);
+			continue;
+		}
 
-  if (unlikely(!ktmm_folio_evictable(folio))) {
-      ktmm_folio_putback_lru(folio);
-      continue;
-  }
+		if (unlikely(buffer_heads_over_limit)) {
+			if (ktmm_folio_needs_release(folio) &&
+				folio_trylock(folio)) {
+				filemap_release_folio(folio, 0);
+				folio_unlock(folio);
+			}
+		}
 
-  if (unlikely(buffer_heads_over_limit)) {
-      if (ktmm_folio_needs_release(folio) &&
-          folio_trylock(folio)) {
-          filemap_release_folio(folio, 0);
-          folio_unlock(folio);
-      }
-  }
+		// node migration
+		if (pgdat->pm_node != 0) {
+			if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup, &vm_flags)) {
+				pr_debug("set promote");
+				folio_set_promote(folio);
+				list_add(&folio->lru, &l_promote);
+				continue;
+			}
+		}
 
-  // node migration
-  if (pgdat->pm_node != 0) {
-      //pr_debug("active pm_node");
-      if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup, &vm_flags)) {
-          pr_debug("set promote");
-          //SetPagePromote(page); NEEDS TO BE MODULE TRACKED
-          folio_set_promote(folio);
-          list_add(&folio->lru, &l_promote);
-          continue;
-      }
-  }
+		// Referenced or rmap lock contention: rotate
+		if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup,
+				   &vm_flags) != 0) {
+			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
+				nr_rotated += folio_nr_pages(folio);
+				list_add(&folio->lru, &l_active);
+				continue;
+			}
+		}
 
-  // Referenced or rmap lock contention: rotate
-  if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup,
-                   &vm_flags) != 0) {
-      if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
-          nr_rotated += folio_nr_pages(folio);
-          list_add(&folio->lru, &l_active);
-          continue;
-      }
-  }
+		folio_clear_active(folio);	// we are de-activating
+		folio_set_workingset(folio);
+		list_add(&folio->lru, &l_inactive);
+	}
 
-  folio_clear_active(folio);	// we are de-activating
-  folio_set_workingset(folio);
-  list_add(&folio->lru, &l_inactive);
+	// Move folios back to the lru list.
+	spin_lock_irq(&lruvec->lru_lock);
+
+	nr_activate = ktmm_move_folios_to_lru(lruvec, &l_active);
+	nr_deactivate = ktmm_move_folios_to_lru(lruvec, &l_inactive);
+	nr_promote = ktmm_move_folios_to_lru(lruvec, &l_promote);
+
+	pr_debug("pgdat %d folio activated: %d", nid, nr_activate);
+	pr_debug("pgdat %d folio deactivated: %d", nid, nr_deactivate);
+	pr_debug("pgdat %d folio promoted: %d", nid, nr_promote);
+
+	// Keep all free folios in l_active list
+	list_splice(&l_inactive, &l_active);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+
+	spin_unlock_irq(&lruvec->lru_lock);
+
+	ktmm_cgroup_uncharge_list(&l_active);
+	ktmm_free_unref_page_list(&l_active);
+
+	return actual_scanned;  // Return actual pages scanned
 }
-
-// Move folios back to the lru list.
-spin_lock_irq(&lruvec->lru_lock);
-
-nr_activate = ktmm_move_folios_to_lru(lruvec, &l_active);
-nr_deactivate = ktmm_move_folios_to_lru(lruvec, &l_inactive);
-nr_promote = ktmm_move_folios_to_lru(lruvec, &l_promote);
-
-pr_debug("pgdat %d folio activated: %d", nid, nr_activate);
-pr_debug("pgdat %d folio deactivated: %d", nid, nr_deactivate);
-pr_debug("pgdat %d folio promoted: %d", nid, nr_promote);
-
-// Keep all free folios in l_active list
-list_splice(&l_inactive, &l_active);
-
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
-
-spin_unlock_irq(&lruvec->lru_lock);
-
-ktmm_cgroup_uncharge_list(&l_active);
-ktmm_free_unref_page_list(&l_active);
-
-return actual_scanned;  // Return actual pages scanned
-return nr_scanned; 
-}
-
-/**
 
 /**
  * scan_inactive_list - scan inactive lru list folios
@@ -586,228 +566,237 @@ return nr_scanned;
  * @sc:			scan control
  * @lru:		lru list to scan
  * @pgdat:		node data
+ *
+ * This is a reimplementation of shrink_inactive_list from vmscan.c.
  */
 static unsigned long scan_inactive_list(unsigned long nr_to_scan,
-  struct lruvec *lruvec,
-  struct scan_control *sc,
-  enum lru_list lru,
-  struct pglist_data *pgdat)
+				struct lruvec *lruvec,
+				struct scan_control *sc,
+				enum lru_list lru,
+				struct pglist_data *pgdat)
 {
-//printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+	LIST_HEAD(folio_list);
+	unsigned long nr_scanned;
+	unsigned long nr_taken = 0;
+	unsigned long nr_migrated = 0;
+	unsigned long nr_reclaimed = 0;
+	bool file = is_file_lru(lru);
+	int nid = pgdat->node_id;
 
-LIST_HEAD(folio_list);
-unsigned long nr_scanned;
-unsigned long nr_taken = 0;
-unsigned long nr_migrated = 0;
-// REMOVED: unsigned long nr_reclaimed = 0; // This variable is unused
-bool file = is_file_lru(lru);
-int nid = pgdat->node_id;
+	// make sure pages in per-cpu lru list are added
+	ktmm_lru_add_drain();
 
-// make sure pages in per-cpu lru list are added
-ktmm_lru_add_drain();
+	// We want to isolate the pages we are going to scan.
+	spin_lock_irq(&lruvec->lru_lock);
 
-// We want to isolate the pages we are going to scan.
-spin_lock_irq(&lruvec->lru_lock);
+	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
+				     &nr_scanned, sc, lru);
 
-nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
-                 &nr_scanned, sc, lru);
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	spin_unlock_irq(&lruvec->lru_lock);
 
-spin_unlock_irq(&lruvec->lru_lock);
+	if (nr_taken == 0) return 0;
 
-if (nr_taken == 0) return 0;
+	/* LOG EACH PAGE BEING SCANNED */
+	struct folio *folio, *folio_tmp;
+	list_for_each_entry_safe(folio, folio_tmp, &folio_list, lru) {
+		log_page_scan(folio, lru, pgdat);
+	}
 
-//dummy code - migration disabled
-if (pgdat->pm_node == 0 && pmem_node_id != -1) {
-nr_migrated = 0;
-pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from inactive list", nid, nr_taken);
+	// dummy code - migration disabled
+	if (pgdat->pm_node == 0 && pmem_node_id != -1) {
+		nr_migrated = 0;  // No migration actually happens
+		pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from inactive list", nid, nr_taken);
+	}
+
+	spin_lock_irq(&lruvec->lru_lock);
+
+	ktmm_move_folios_to_lru(lruvec, &folio_list);
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+
+	spin_unlock_irq(&lruvec->lru_lock);
+
+	ktmm_cgroup_uncharge_list(&folio_list);
+	ktmm_free_unref_page_list(&folio_list);
+
+	return nr_taken;  // Return actual pages found
 }
 
-spin_lock_irq(&lruvec->lru_lock);
-
-ktmm_move_folios_to_lru(lruvec, &folio_list);
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
-
-spin_unlock_irq(&lruvec->lru_lock);
-
-ktmm_cgroup_uncharge_list(&folio_list);
-ktmm_free_unref_page_list(&folio_list);
-
-return nr_taken;
-}
-
+/**
+ * scan_promote_list - scan promote lru folios for migration
+ *
+ * @nr_to_scan:		number to scan
+ * @lruvec:		target lruvec
+ * @sc:			scan control
+ * @lru:		lru list to scan
+ * @pgdat:		node data
+ *
+ * Returns: number of pages actually scanned
+ */
 static unsigned long scan_promote_list(unsigned long nr_to_scan,
-  struct lruvec *lruvec,
-  struct scan_control *sc,
-  enum lru_list lru,
-  struct pglist_data *pgdat)
+	struct lruvec *lruvec,
+	struct scan_control *sc,
+	enum lru_list lru,
+	struct pglist_data *pgdat)
 {
-//printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+	unsigned long nr_taken;
+	unsigned long nr_scanned;
+	unsigned long nr_migrated = 0;
+	isolate_mode_t isolate_mode = 0;
+	LIST_HEAD(l_hold);
+	int file = is_file_lru(lru);
+	int nid = pgdat->node_id;
 
-unsigned long nr_taken;
-unsigned long nr_scanned;
-unsigned long nr_migrated = 0;
-isolate_mode_t isolate_mode = 0;
-LIST_HEAD(l_hold);
-int file = is_file_lru(lru);
-int nid = pgdat->node_id;
+	struct list_head *src = &lruvec->lists[lru];
 
-struct list_head *src = &lruvec->lists[lru];
+	if (list_empty(src))
+		pr_debug("promote list empty");
 
-if (list_empty(src))
-  pr_debug("promote list empty");
+	if (!sc->may_unmap)
+		isolate_mode |= ISOLATE_UNMAPPED;
 
-//pr_debug("scanning promote list");
+	ktmm_lru_add_drain();
 
-if (!sc->may_unmap)
-  isolate_mode |= ISOLATE_UNMAPPED;
+	spin_lock_irq(&lruvec->lru_lock);
 
-ktmm_lru_add_drain();
+	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
+			      &nr_scanned, sc, lru);
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
-spin_lock_irq(&lruvec->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock);
 
-nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
-              &nr_scanned, sc, lru);
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	pr_debug("pgdat %d scanned %lu on promote list", nid, nr_scanned);
+	pr_debug("pgdat %d taken %lu on promote list", nid, nr_taken);
 
-spin_unlock_irq(&lruvec->lru_lock);
+	/* LOG EACH PAGE IN PROMOTE LIST */
+	struct folio *folio, *folio_tmp;
+	list_for_each_entry_safe(folio, folio_tmp, &l_hold, lru) {
+		log_page_scan(folio, lru, pgdat);
+	}
 
-pr_debug("pgdat %d scanned %lu on promote list", nid, nr_scanned);
-pr_debug("pgdat %d taken %lu on promote list", nid, nr_taken);
+	unsigned long actual_scanned = nr_scanned;
 
-// Store actual scanned count for return
-unsigned long actual_scanned = nr_scanned;
+	// dummy code - migration disabled
+	if (nr_taken) {
+		nr_migrated = 0;  // No migration actually happens
+		pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from promote list", nid, nr_taken);
+	}
 
-//dummy code - migration disabled
-if (nr_taken) {
-  nr_migrated = 0;  // No migration actually happens
-  pr_debug("pgdat %d MIGRATION DISABLED - would have migrated %lu folios from promote list", nid, nr_taken);
-}
+	spin_lock_irq(&lruvec->lru_lock);
 
-spin_lock_irq(&lruvec->lru_lock);
+	ktmm_move_folios_to_lru(lruvec, &l_hold);
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
 
-ktmm_move_folios_to_lru(lruvec, &l_hold);
-__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+	spin_unlock_irq(&lruvec->lru_lock);
 
-spin_unlock_irq(&lruvec->lru_lock);
+	ktmm_cgroup_uncharge_list(&l_hold);
+	ktmm_free_unref_page_list(&l_hold);
 
-ktmm_cgroup_uncharge_list(&l_hold);
-ktmm_free_unref_page_list(&l_hold);
-
-return actual_scanned;  // Return actual pages scanned
+	return actual_scanned;  // Return actual pages scanned
 }
 
 /* SIMILAR TO: shrink_list() */
 /**
-* scan_list - determines which scan function to call per list
-*
-* @lru:		lru list to scan
-* @nr_to_scan:		number to scan
-* @lruvec:		target lruvec
-* @sc:			scan control
-* @pgdat:		node data
-*
-* Returns: number of pages actually scanned
-*/
+ * scan_list - determines which scan function to call per list
+ *
+ * @lru:		lru list to scan
+ * @nr_to_scan:		number to scan
+ * @lruvec:		target lruvec
+ * @sc:			scan control
+ * @pgdat:		node data
+ *
+ * Returns: number of pages actually scanned
+ */
 static unsigned long scan_list(enum lru_list lru, 
-unsigned long nr_to_scan,
-struct lruvec *lruvec, 
-struct scan_control *sc,
-struct pglist_data *pgdat)
+	unsigned long nr_to_scan,
+	struct lruvec *lruvec, 
+	struct scan_control *sc,
+	struct pglist_data *pgdat)
 {
-printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+	unsigned long pages_found = 0;
 
-unsigned long pages_found = 0;
+	if (is_active_lru(lru)) {
+		pages_found += scan_active_list(nr_to_scan, lruvec, sc, lru, pgdat);
+	}
+	else if(is_promote_lru(lru)) {
+		pages_found += scan_promote_list(nr_to_scan, lruvec, sc, lru, pgdat);
+	}
+	else {
+		pages_found += scan_inactive_list(nr_to_scan, lruvec, sc, lru, pgdat);
+	}
 
-if (is_active_lru(lru)) {
-  pages_found += scan_active_list(nr_to_scan, lruvec, sc, lru, pgdat);
+	return pages_found;
 }
-else if(is_promote_lru(lru)) {
-  pages_found += scan_promote_list(nr_to_scan, lruvec, sc, lru, pgdat);
-}
-else {
-  pages_found += scan_inactive_list(nr_to_scan, lruvec, sc, lru, pgdat);
-}
-
-return pages_found;
-}
-
 
 /**
  * scan_node - scan a node's LRU lists
  * 
  * @pgdat:	node data struct
- * @nid:	node ID number
+ * @sc:		scan control
  * @reclaim:	memory reclaim cookie
  *
  * This is responsible for scanning the lruvec per memory cgroup.
  */
 static void scan_node(pg_data_t *pgdat, 
-  struct scan_control *sc,
-  struct mem_cgroup_reclaim_cookie *reclaim)
+	struct scan_control *sc,
+	struct mem_cgroup_reclaim_cookie *reclaim)
 {
- // printk(KERN_INFO "sudarshan: entered %s\n", __func__);
+	enum lru_list lru;
+	struct mem_cgroup *memcg;
+	int nid = pgdat->node_id;
 
-  enum lru_list lru;
-  struct mem_cgroup *memcg;
-  int nid = pgdat->node_id;
+	printk(KERN_INFO "sudarshan: Scanning Node %d (Type: %s)", nid, 
+		pgdat->pm_node ? "PMEM" : "DRAM");
 
-  printk(KERN_INFO "sudarshan: Scanning Node %d (Type: %s)", nid, 
-    pgdat->pm_node ? "PMEM" : "DRAM");
+	int memcg_count;
+	unsigned long node_pages_scanned = 0;
 
-  int memcg_count;
-  
-  /* ADD: Per-scan counters */
-  unsigned long node_pages_scanned = 0;
+	memset(&sc->nr, 0, sizeof(sc->nr));
+	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
+	sc->target_mem_cgroup = memcg;
 
-  memset(&sc->nr, 0, sizeof(sc->nr));
-  memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
-  sc->target_mem_cgroup = memcg;
+	memcg_count = 0;
+	do {
+		struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
+		unsigned long reclaimed;
+		unsigned long scanned;
 
-  //pr_info("scanning lists on node %d", nid);
-  memcg_count = 0;
-  do {
-      struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
-      unsigned long reclaimed;
-      unsigned long scanned;
+		memcg_count += 1;
 
-      memcg_count += 1;
+		if (ktmm_cgroup_below_min(memcg)) {
+			continue;
+		} else if (ktmm_cgroup_below_low(memcg)) {
+			if (!sc->memcg_low_reclaim) {
+				sc->memcg_low_skipped = 1;
+				continue;
+			}
+		}
 
-      if (ktmm_cgroup_below_min(memcg)) {
-          continue;
-      } else if (ktmm_cgroup_below_low(memcg)) {
-          if (!sc->memcg_low_reclaim) {
-              sc->memcg_low_skipped = 1;
-              continue;
-          }
-      }
+		reclaimed = sc->nr_reclaimed;
+		scanned = sc->nr_scanned;
 
-      reclaimed = sc->nr_reclaimed;
-      scanned = sc->nr_scanned;
+		for_each_evictable_lru(lru) {
+			unsigned long nr_to_scan = 32;
+			unsigned long pages_found = scan_list(lru, nr_to_scan, lruvec, sc, pgdat);
+			node_pages_scanned += pages_found;
+		}
+	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 
-      for_each_evictable_lru(lru) {
-          unsigned long nr_to_scan = 32;
-          unsigned long pages_found = scan_list(lru, nr_to_scan, lruvec, sc, pgdat);
-          node_pages_scanned += pages_found;  // Track pages found in this scan
-      }
-  } while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
-
-  /* ADD: Update global counters and print summary */
-  if (pgdat->pm_node) {
-      total_pmem_pages_scanned += node_pages_scanned;
-  } else {
-      total_dram_pages_scanned += node_pages_scanned;
-  }
-  
-  printk(KERN_INFO "=== SCAN CYCLE %lu SUMMARY ===\n", ++scan_cycle_count);
-  printk(KERN_INFO "Node %d (%s): %lu pages scanned this cycle\n", 
-         nid, pgdat->pm_node ? "PMEM" : "DRAM", node_pages_scanned);
-  printk(KERN_INFO "TOTAL DRAM pages scanned: %lu\n", total_dram_pages_scanned);
-  printk(KERN_INFO "TOTAL PMEM pages scanned: %lu\n", total_pmem_pages_scanned);
-  printk(KERN_INFO "==============================\n");
+	/* UPDATE GLOBAL COUNTERS AND PRINT SUMMARY */
+	if (pgdat->pm_node) {
+		total_pmem_pages_scanned += node_pages_scanned;
+	} else {
+		total_dram_pages_scanned += node_pages_scanned;
+	}
+	
+	printk(KERN_INFO "=== SCAN CYCLE %lu SUMMARY ===\n", ++scan_cycle_count);
+	printk(KERN_INFO "Node %d (%s): %lu pages scanned this cycle\n", 
+		   nid, pgdat->pm_node ? "PMEM" : "DRAM", node_pages_scanned);
+	printk(KERN_INFO "TOTAL DRAM pages scanned: %lu\n", total_dram_pages_scanned);
+	printk(KERN_INFO "TOTAL PMEM pages scanned: %lu\n", total_pmem_pages_scanned);
+	printk(KERN_INFO "==============================\n");
 }
-
 
 /*****************************************************************************
  * Daemon Functions & Related
@@ -824,12 +813,8 @@ static void scan_node(pg_data_t *pgdat,
  */
 static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	long remaining = 0;
 	DEFINE_WAIT(wait);
-
-	//pr_info("tmemd trying to sleep: %d", nid);
 
 	if (freezing(current) || kthread_should_stop())
 		return;
@@ -840,7 +825,6 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 	finish_wait(&tmemd_wait[nid], &wait);
 }
 
-
 /**
  * tmemd - page promotion daemon
  *
@@ -850,8 +834,6 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
  */
 static int tmemd(void *p) 
 {
-  //printk(KERN_INFO "sudarshan: entered %s\n", __func__);
-
 	pg_data_t *pgdat = (pg_data_t *)p;
 	int nid = pgdat->node_id;
 	struct task_struct *task = current;
@@ -867,9 +849,8 @@ static int tmemd(void *p)
 
 	struct scan_control sc = {
 		.nr_to_reclaim = SWAP_CLUSTER_MAX,
-		//.gfp_mask = TMEMD_GFP_FLAGS,
 		.priority = DEF_PRIORITY,
-		.may_writepage = !laptop_mode, //do not delay writing to disk
+		.may_writepage = !laptop_mode,
 		.may_unmap = 1,
 		.may_swap = 1,
 		.reclaim_idx = MAX_NR_ZONES - 1,
@@ -885,13 +866,8 @@ static int tmemd(void *p)
 	/*
 	 * Tell MM that we are a memory allocator, and that we are actually
 	 * kswapd. We are also set to suspend as needed.
-	 *
-	 * Flags are located in include/sched.h for more info.
 	 */
 	task->flags |= PF_MEMALLOC | PF_KSWAPD;
-
-
-	//pr_info("tmemd started on node %d", nid);
 
 	/*
 	 * Loop every few seconds and scan the node's LRU lists.
@@ -912,12 +888,11 @@ static int tmemd(void *p)
 	return 0;
 }
 
-
 /*****************************************************************************
  * Start & Stop
  *****************************************************************************/
 
-/****************** ADD VMSCAN HOOKS HERE ************************/
+/****************** VMSCAN HOOKS ************************/
 static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
 	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
@@ -934,19 +909,13 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("__alloc_pages", ktmm_alloc_pages, &pt_alloc_pages),
 };
 
-
 /**
- * Daemons are only started on online/active nodes. They are
- * currently stored in a local array.
+ * tmemd_start_available - Start daemon threads on available nodes
  *
- * We will also need to define the behavior for hot-plugging nodes
- * into the system, as this code only sets up daemons on nodes 
- * that are online the moment the module starts.
- *
+ * Daemons are only started on online/active nodes.
  */
 int tmemd_start_available(void) 
 {
-  
 	int i;
 	int nid;
 	int ret;
@@ -963,23 +932,23 @@ int tmemd_start_available(void)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
 
-		/* !! EMULATE PMEM NODE !! */
+		/* EMULATE PMEM NODE */
 		if (nid == 1) {
 			pr_info("Emulating pmem node");
 			set_pmem_node_id(nid);
 			set_pmem_node(nid);
 		}
 
-        	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
+		tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
 
 	return ret;
 }
 
-
 /**
- * This stops all thread daemons for each node when exiting.
- * It uses the node ID to grab the daemon out of our local list.
+ * tmemd_stop_all - Stop all thread daemons for each node when exiting
+ *
+ * Uses the node ID to grab the daemon out of the local list.
  */
 void tmemd_stop_all(void)
 {
@@ -992,5 +961,3 @@ void tmemd_stop_all(void)
 
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
-
-
