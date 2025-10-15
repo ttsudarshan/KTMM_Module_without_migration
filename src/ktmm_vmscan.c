@@ -47,10 +47,16 @@
 // possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
 
+// Convert jiffies to milliseconds
+unsigned long jiffies_to_ms(unsigned long jiffies_val)
+{
+    return jiffies_val * 1000 / HZ;
+}
+
 // KTMM: Macro for page access tracking
 #define PRINT_PAGE_ACCESS(page_addr, node_type) \
-	printk(KERN_INFO "PAGE_ACCESS | Addr: %p | Jiffies: %lu | Node: %s\n", \
-		(void *)(page_addr), jiffies, (node_type == 0) ? "DRAM" : "PMEM")
+    printk(KERN_INFO "PAGE_ACCESS | Addr: %p | Jiffies: %lu ms | Node: %s\n", \
+        (void *)(page_addr), jiffies_to_ms(jiffies), (node_type == 0) ? "DRAM" : "PMEM")
 
 // which node is the pmem node
 int pmem_node = -1;
