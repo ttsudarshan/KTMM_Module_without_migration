@@ -38,9 +38,9 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/swap.h>
+#include <linux/timekeeping.h>
 #include <linux/vmstat.h>
 #include <linux/wait.h>
-#include <linux/timekeeping.h>
 
 #include "ktmm_hook.h"
 #include "ktmm_vmscan.h"
@@ -69,7 +69,7 @@ static struct task_struct *tmemd_list[MAX_NUMNODES];
 /* per node tmemd wait queues */
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
-/* KTMM: Scan time tracking structures */
+/* Scan time tracking structures */
 struct scan_stats {
     u64 active_scan_time_ns;
     u64 inactive_scan_time_ns;
@@ -465,21 +465,18 @@ static void scan_promote_list(unsigned long nr_to_scan,
 	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
 				&nr_scanned, sc, lru);
 
-	// KTMM: Start timing AFTER isolation
+	// Start timing AFTER isolation
 	start_time = ktime_get();
 
 	/* KTMM: Track pages being scanned on promote list */
 	if (nr_taken > 0) {
 		struct folio *folio;
 		list_for_each_entry(folio, &l_hold, lru) {
-			//unsigned long page_addr = (unsigned long)folio_address(folio);
-			//int node_type = pgdat->pm_node;  /* 0 for DRAM, 1 for PMEM */
-			//PRINT_PAGE_ACCESS(page_addr, node_type);
 			node_scan_stats[nid].promote_pages_scanned++;
 		}
 	}
 
-	// KTMM: End timing BEFORE any prints
+	// End timing BEFORE any prints
 	end_time = ktime_get();
 	node_scan_stats[nid].promote_scan_time_ns += ktime_to_ns(ktime_sub(end_time, start_time));
 
@@ -568,7 +565,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
-	// KTMM: Start timing before scanning loop
+	// Start timing before scanning loop
 	start_time = ktime_get();
 
 	while (!list_empty(&l_hold)) {
@@ -578,10 +575,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 		folio = lru_to_folio(&l_hold);
 		list_del(&folio->lru);
 
-		/* KTMM: Track page access */
-		//unsigned long page_addr = (unsigned long)folio_address(folio);
-		//int node_type = pgdat->pm_node;  /* 0 for DRAM, 1 for PMEM */
-		//PRINT_PAGE_ACCESS(page_addr, node_type);
+		// Track the page (no printing)
 		node_scan_stats[nid].active_pages_scanned++;
 
 		if (unlikely(!ktmm_folio_evictable(folio))) {
@@ -642,7 +636,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 		list_add(&folio->lru, &l_inactive);
 	}
 
-	// KTMM: End timing after scanning loop
+	// End timing after scanning loop
 	end_time = ktime_get();
 	node_scan_stats[nid].active_scan_time_ns += ktime_to_ns(ktime_sub(end_time, start_time));
 
@@ -697,7 +691,6 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_scanned;
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
-	unsigned long nr_reclaimed = 0;
 	bool file = is_file_lru(lru);
 	int nid = pgdat->node_id;
 	ktime_t start_time, end_time;
@@ -712,21 +705,18 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
 
-	// KTMM: Start timing after isolation
+	// Start timing after isolation
 	start_time = ktime_get();
 
 	/* KTMM: Track pages being scanned on inactive list */
 	if (nr_taken > 0) {
 		struct folio *folio;
 		list_for_each_entry(folio, &folio_list, lru) {
-			//unsigned long page_addr = (unsigned long)folio_address(folio);
-			//int node_type = pgdat->pm_node;  /* 0 for DRAM, 1 for PMEM */
-			//PRINT_PAGE_ACCESS(page_addr, node_type);
 			node_scan_stats[nid].inactive_pages_scanned++;
 		}
 	}
 
-	// KTMM: End timing before any further processing
+	// End timing before any further processing
 	end_time = ktime_get();
 	node_scan_stats[nid].inactive_scan_time_ns += ktime_to_ns(ktime_sub(end_time, start_time));
 
@@ -814,7 +804,7 @@ static void scan_node(pg_data_t *pgdat,
 	int memcg_count;
 	const char *node_type_str = (pgdat->pm_node == 0) ? "DRAM" : "PMEM";
 
-	// KTMM: Reset statistics for this scan
+	// Reset statistics for this scan
 	reset_scan_stats(nid);
 
 	memset(&sc->nr, 0, sizeof(sc->nr));
@@ -860,18 +850,18 @@ static void scan_node(pg_data_t *pgdat,
 		}
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 
-	// KTMM: Print statistics at the end of scan
-	pr_info("SCAN_STATS | Node: %d (%s) | Active: %lu pages in %llu ns (%.3f us) | Inactive: %lu pages in %llu ns (%.3f us) | Promote: %lu pages in %llu ns (%.3f us)",
+	// Print statistics at the end of scan (convert ns to us using integer division)
+	pr_info("SCAN_STATS | Node: %d (%s) | Active: %lu pages in %llu ns (%llu us) | Inactive: %lu pages in %llu ns (%llu us) | Promote: %lu pages in %llu ns (%llu us)",
 		nid, node_type_str,
 		node_scan_stats[nid].active_pages_scanned,
 		node_scan_stats[nid].active_scan_time_ns,
-		node_scan_stats[nid].active_scan_time_ns / 1000.0,
+		node_scan_stats[nid].active_scan_time_ns / 1000,
 		node_scan_stats[nid].inactive_pages_scanned,
 		node_scan_stats[nid].inactive_scan_time_ns,
-		node_scan_stats[nid].inactive_scan_time_ns / 1000.0,
+		node_scan_stats[nid].inactive_scan_time_ns / 1000,
 		node_scan_stats[nid].promote_pages_scanned,
 		node_scan_stats[nid].promote_scan_time_ns,
-		node_scan_stats[nid].promote_scan_time_ns / 1000.0);
+		node_scan_stats[nid].promote_scan_time_ns / 1000);
 }
 
 
