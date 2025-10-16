@@ -81,6 +81,23 @@ struct scan_stats {
 
 static struct scan_stats node_scan_stats[MAX_NUMNODES];
 
+/* Global stats to track both nodes together */
+struct global_scan_stats {
+    u64 dram_active_time_ns;
+    u64 dram_inactive_time_ns;
+    u64 pmem_active_time_ns;
+    u64 pmem_inactive_time_ns;
+    u64 pmem_promote_time_ns;
+    unsigned long dram_active_pages;
+    unsigned long dram_inactive_pages;
+    unsigned long pmem_active_pages;
+    unsigned long pmem_inactive_pages;
+    unsigned long pmem_promote_pages;
+    unsigned long scan_count;
+};
+
+static struct global_scan_stats global_stats = {0};
+
 static inline void reset_scan_stats(int nid)
 {
     node_scan_stats[nid].active_scan_time_ns = 0;
